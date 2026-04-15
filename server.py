@@ -25,6 +25,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 import yt_dlp
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -73,13 +74,30 @@ def _is_bot_detection_error(error: Exception) -> bool:
     return "sign in to confirm" in msg or "bot" in msg or "cookies" in msg
 
 
+# Format selector used for all audio extraction.
+# Fallback chain: best audio-only m4a → any audio-only → best combined → absolute best.
+# This handles restricted videos, older uploads, and region-locked content gracefully.
+_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
+
+
 def _fetch_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL(_ydl_opts_base()) as ydl:
+    opts = {**_ydl_opts_base(), "format": _AUDIO_FORMAT}
+    with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def _safe_filename(title: str) -> str:
     return "".join(c for c in title if c not in r'\/:*?"<>|').strip()
+
+
+def _content_disposition(filename: str) -> str:
+    """
+    Build a Content-Disposition header that handles non-ASCII filenames (RFC 6266).
+    Provides an ASCII fallback for old clients and a UTF-8 percent-encoded name for modern ones.
+    """
+    ascii_fallback = filename.encode("ascii", errors="ignore").decode("ascii").strip() or "audio"
+    utf8_encoded = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_encoded}"
 
 
 def _stream_chunks(path: str, chunk_size: int = 65536):
@@ -316,7 +334,7 @@ def stream_audio(
             output_template = os.path.join(tmpdir, "audio.%(ext)s")
             ydl_opts = {
                 **_ydl_opts_base(),
-                "format": "bestaudio/best",
+                "format": _AUDIO_FORMAT,
                 "outtmpl": output_template,
                 "postprocessors": [
                     {
@@ -343,7 +361,7 @@ def stream_audio(
     return StreamingResponse(
         generate(),
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _content_disposition(filename)},
     )
 
 
@@ -380,7 +398,7 @@ def stream_audio_raw(
             output_template = os.path.join(tmpdir, "audio.%(ext)s")
             ydl_opts = {
                 **_ydl_opts_base(),
-                "format": "bestaudio/best",
+                "format": _AUDIO_FORMAT,
                 "outtmpl": output_template,
             }
             try:
@@ -400,5 +418,5 @@ def stream_audio_raw(
     return StreamingResponse(
         generate(),
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _content_disposition(filename)},
     )

@@ -1,0 +1,13 @@
+services:
+  audio-server:
+    build: .
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false   # container still starts without .env; env vars just won't be set
+    environment:
+      - PYTHONUNBUFFERED=1
+    tmpfs:
+      - /tmp        # yt-dlp writes temp files here; keeps the container FS clean

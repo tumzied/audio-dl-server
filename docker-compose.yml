@@ -11,3 +11,13 @@ services:
       - PYTHONUNBUFFERED=1
     tmpfs:
       - /tmp        # yt-dlp writes temp files here; keeps the container FS clean
+    volumes:
+      # Optional: mount a cookies.txt for YouTube bot-detection bypass.
+      # Export from browser with "Get cookies.txt LOCALLY" extension, then uncomment:
+      # - ./cookies.txt:/app/cookies.txt:ro
+      #
+      # Or leave commented and use POST /cookies to upload via API instead.
+      - cookies_data:/app/cookies_store
+
+volumes:
+  cookies_data:

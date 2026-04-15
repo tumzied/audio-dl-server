@@ -1,6 +1,9 @@
 # Environment
 .env
 
+# YouTube cookies — contains session tokens, never commit
+cookies.txt
+
 # Python
 __pycache__/
 *.py[cod]

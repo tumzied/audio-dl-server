@@ -2,10 +2,14 @@
 YouTube Audio Streaming Server
 ================================
 Endpoints:
-  GET /search?q=...&limit=5   — search YouTube, return video suggestions
-  GET /info?url=...           — video metadata (no download)
-  GET /stream?url=...&fmt=... — download audio, convert to fmt via ffmpeg (requires ffmpeg)
-  GET /stream/raw?url=...     — stream native audio format, no ffmpeg required
+  POST /auth/token              — get a JWT access token
+  GET  /health                  — server + YouTube auth health check (public)
+  POST /cookies                 — upload a Netscape cookies.txt (admin)
+  GET  /cookies/status          — cookies file info + age warning (admin)
+  GET  /search?q=...&limit=5    — search YouTube
+  GET  /info?url=...            — video metadata (no download)
+  GET  /stream?url=...&fmt=...  — download + convert audio (requires ffmpeg)
+  GET  /stream/raw?url=...      — stream native audio, no conversion
 
 Requirements:
   pip install fastapi uvicorn yt-dlp
@@ -16,12 +20,14 @@ Run:
 """
 
 import os
+import time
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
 import yt_dlp
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -38,14 +44,37 @@ MIME_TYPES = {
     "ogg": "audio/ogg",
 }
 
+# Path where cookies are stored. Override via COOKIES_FILE env var.
+# In Docker: mount ./cookies.txt:/app/cookies.txt:ro  OR  use POST /cookies
+COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+
+# A well-known short public video used for health checks
+_HEALTH_CHECK_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo" — first YouTube video, stable forever
+
+# Warn in /cookies/status if cookies file is older than this many days
+_COOKIE_WARN_AGE_DAYS = int(os.getenv("COOKIE_WARN_AGE_DAYS", "14"))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _ydl_opts_base() -> dict:
+    """Base yt-dlp options, injecting cookies if the file exists."""
+    opts: dict = {"quiet": True, "no_warnings": True}
+    if Path(COOKIES_FILE).is_file():
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def _is_bot_detection_error(error: Exception) -> bool:
+    """Return True when YouTube is blocking us due to missing/expired cookies."""
+    msg = str(error).lower()
+    return "sign in to confirm" in msg or "bot" in msg or "cookies" in msg
+
+
 def _fetch_info(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_opts_base()) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -59,7 +88,26 @@ def _stream_chunks(path: str, chunk_size: int = 65536):
             yield chunk
 
 
-# Shorthand for the auth dependency used on every protected endpoint
+def _raise_for_yt_error(exc: Exception, context: str = "") -> None:
+    """
+    Convert yt-dlp exceptions into appropriate HTTP responses.
+    Bot detection → 503 (service issue, not client's fault).
+    Everything else → 400.
+    """
+    prefix = f"{context}: " if context else ""
+    if _is_bot_detection_error(exc):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{prefix}YouTube is requiring authentication. "
+                "The server's cookies may be missing or expired. "
+                "Please contact the administrator."
+            ),
+        )
+    raise HTTPException(status_code=400, detail=f"{prefix}{exc}")
+
+
+# Shorthand for the auth dependency
 Auth = Annotated[dict, Depends(require_auth)]
 
 
@@ -71,8 +119,7 @@ Auth = Annotated[dict, Depends(require_auth)]
 def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     """
     Obtain a JWT access token.
-    Submit `username` + `password` as form data (application/x-www-form-urlencoded).
-    Use the returned token as `Authorization: Bearer <token>` on all other endpoints.
+    Submit username + password as form data.
     """
     hashed = USERS.get(form_data.username)
     if not hashed or not verify_password(form_data.password, hashed):
@@ -81,27 +128,114 @@ def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     return {"access_token": token, "token_type": "bearer"}
 
 
+@app.get("/health", tags=["admin"])
+def health_check():
+    """
+    Public endpoint — checks server status and YouTube reachability.
+    The mobile app can call this on startup to detect expired cookies early.
+
+    youtube_status values:
+      "ok"       — authenticated and working
+      "degraded" — bot detection / cookies missing or expired
+      "error"    — unexpected failure
+    """
+    cookies_loaded = Path(COOKIES_FILE).is_file()
+
+    try:
+        opts = {**_ydl_opts_base(), "extract_flat": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(_HEALTH_CHECK_VIDEO, download=False)
+        youtube_status = "ok"
+        youtube_detail = None
+    except Exception as exc:
+        if _is_bot_detection_error(exc):
+            youtube_status = "degraded"
+            youtube_detail = "YouTube authentication required — cookies missing or expired"
+        else:
+            youtube_status = "error"
+            youtube_detail = str(exc)
+
+    return {
+        "status": "ok" if youtube_status == "ok" else "degraded",
+        "cookies_loaded": cookies_loaded,
+        "youtube_status": youtube_status,
+        "youtube_detail": youtube_detail,
+    }
+
+
+@app.post("/cookies", tags=["admin"])
+async def upload_cookies(auth: Auth, file: UploadFile = File(...)):
+    """
+    Upload a Netscape-format cookies.txt (admin only).
+    Export from your browser with the 'Get cookies.txt LOCALLY' extension.
+    No container restart needed — takes effect immediately.
+    """
+    content = await file.read()
+    if not content.strip().startswith(b"# "):
+        raise HTTPException(
+            status_code=400,
+            detail="File does not look like a Netscape cookies.txt (expected '# Netscape HTTP Cookie File' header)",
+        )
+    Path(COOKIES_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(COOKIES_FILE).write_bytes(content)
+    return {
+        "detail": "Cookies saved. All subsequent requests will use them.",
+        "size_bytes": len(content),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/cookies/status", tags=["admin"])
+def cookies_status(auth: Auth):
+    """
+    Returns cookies file info including age.
+    Warns when the file is older than COOKIE_WARN_AGE_DAYS (default 14 days).
+    YouTube cookies typically last weeks to a few months before expiring.
+    """
+    path = Path(COOKIES_FILE)
+    if not path.is_file():
+        return {
+            "loaded": False,
+            "warning": "No cookies file found. YouTube bot-detection may block requests.",
+        }
+
+    stat = path.stat()
+    age_days = (time.time() - stat.st_mtime) / 86400
+    uploaded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+
+    result = {
+        "loaded": True,
+        "size_bytes": stat.st_size,
+        "uploaded_at": uploaded_at,
+        "age_days": round(age_days, 1),
+    }
+
+    if age_days > _COOKIE_WARN_AGE_DAYS:
+        result["warning"] = (
+            f"Cookies are {round(age_days)} days old. "
+            f"Consider re-uploading via POST /cookies to avoid expiry issues."
+        )
+
+    return result
+
+
 @app.get("/search")
 def search_videos(
     auth: Auth,
     q: str = Query(..., description="Search query"),
     limit: int = Query(5, ge=1, le=25, description="Number of results (1–25)"),
 ):
-    """
-    Search YouTube and return video suggestions.
-    Results include title, url, duration, uploader, view count, and thumbnail.
-    """
+    """Search YouTube and return video suggestions."""
     opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,   # don't fetch full info for each result
+        **_ydl_opts_base(),
+        "extract_flat": True,
         "skip_download": True,
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             results = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_for_yt_error(e, "Search failed")
 
     entries = results.get("entries") or []
     return {
@@ -131,7 +265,7 @@ def video_info(
     try:
         info = _fetch_info(url)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        _raise_for_yt_error(e)
 
     return {
         "title": info.get("title"),
@@ -171,7 +305,7 @@ def stream_audio(
     try:
         info = _fetch_info(url)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch video info: {e}")
+        _raise_for_yt_error(e, "Could not fetch video info")
 
     title = _safe_filename(info.get("title", "audio"))
     filename = f"{title}.{fmt}"
@@ -181,10 +315,9 @@ def stream_audio(
         with tempfile.TemporaryDirectory() as tmpdir:
             output_template = os.path.join(tmpdir, "audio.%(ext)s")
             ydl_opts = {
+                **_ydl_opts_base(),
                 "format": "bestaudio/best",
                 "outtmpl": output_template,
-                "quiet": True,
-                "no_warnings": True,
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -197,7 +330,7 @@ def stream_audio(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
             except Exception as e:
-                print(f"[stream error] download failed: {e}")
+                print(f"[stream error] {e}")
                 return
 
             files = list(Path(tmpdir).iterdir())
@@ -221,50 +354,15 @@ def stream_audio_raw(
 ):
     """
     Stream the best available audio in its native format (no ffmpeg needed).
-    The file extension and MIME type are determined by what YouTube provides
-    (typically .webm/opus or .m4a).
+    Typically returns .webm/opus or .m4a depending on the video.
     """
     try:
         info = _fetch_info(url)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch video info: {e}")
+        _raise_for_yt_error(e, "Could not fetch video info")
 
     title = _safe_filename(info.get("title", "audio"))
 
-    def generate():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "audio.%(ext)s")
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": output_template,
-                "quiet": True,
-                "no_warnings": True,
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-            except Exception as e:
-                print(f"[stream/raw error] download failed: {e}")
-                return
-
-            files = list(Path(tmpdir).iterdir())
-            if not files:
-                print("[stream/raw error] yt-dlp produced no output file")
-                return
-
-            ext = files[0].suffix.lstrip(".")
-            mime = MIME_TYPES.get(ext, "application/octet-stream")
-            # We can't set response headers inside a generator, so we set
-            # filename/mime before yielding — see the outer StreamingResponse.
-            # Store for the closure:
-            generate._ext = ext
-            generate._mime = mime
-            generate._filename = f"{title}.{ext}"
-
-            yield from _stream_chunks(str(files[0]))
-
-    # Run the generator once to get ext/mime (first call just initialises state)
-    # Instead, we probe the format from info directly:
     best_audio = next(
         (
             f for f in reversed(info.get("formats", []))
@@ -276,6 +374,28 @@ def stream_audio_raw(
     ext = best_audio.get("ext", "m4a") if best_audio else "m4a"
     mime = MIME_TYPES.get(ext, "application/octet-stream")
     filename = f"{title}.{ext}"
+
+    def generate():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_template = os.path.join(tmpdir, "audio.%(ext)s")
+            ydl_opts = {
+                **_ydl_opts_base(),
+                "format": "bestaudio/best",
+                "outtmpl": output_template,
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as e:
+                print(f"[stream/raw error] {e}")
+                return
+
+            files = list(Path(tmpdir).iterdir())
+            if not files:
+                print("[stream/raw error] yt-dlp produced no output file")
+                return
+
+            yield from _stream_chunks(str(files[0]))
 
     return StreamingResponse(
         generate(),

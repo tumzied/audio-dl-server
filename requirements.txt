@@ -1,6 +1,8 @@
 fastapi==0.135.3
 uvicorn[standard]==0.30.6
-yt-dlp==2026.3.17
+yt-dlp[default]==2026.3.17
+# curl_cffi: yt-dlp explicitly requires <0.15 — do NOT upgrade past 0.14.x
+curl-cffi==0.14.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1

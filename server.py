@@ -29,6 +29,7 @@ from typing import Annotated
 from urllib.parse import quote
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -74,7 +75,16 @@ _COOKIE_WARN_AGE_DAYS = int(os.getenv("COOKIE_WARN_AGE_DAYS", "14"))
 
 def _ydl_opts_base() -> dict:
     """Base yt-dlp options, injecting cookies if the file exists."""
-    opts: dict = {"quiet": True, "no_warnings": True}
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        # Always treat the URL as a single video even when playlist params
+        # are present (e.g. ?list=RD..., &start_radio=1 from YouTube Radio/Mix links)
+        "noplaylist": True,
+        # Impersonate a real browser to bypass TLS fingerprinting bot detection.
+        # Requires curl_cffi <0.15 (pinned in requirements.txt).
+        "impersonate": ImpersonateTarget("chrome"),
+    }
     if Path(COOKIES_FILE).is_file():
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -93,8 +103,9 @@ _AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 
 
 def _fetch_info(url: str) -> dict:
-    opts = {**_ydl_opts_base(), "format": _AUDIO_FORMAT}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    # No format selector here — we only need metadata.
+    # Format validation belongs in the download step, not info extraction.
+    with yt_dlp.YoutubeDL(_ydl_opts_base()) as ydl:
         return ydl.extract_info(url, download=False)
 
 

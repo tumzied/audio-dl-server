@@ -19,6 +19,7 @@ Run:
   uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import logging
 import os
 import time
 import tempfile
@@ -34,6 +35,17 @@ from fastapi.security import OAuth2PasswordRequestForm
 
 from auth import USERS, create_access_token, require_auth, verify_password
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger("audio-server")
+
 app = FastAPI(title="YouTube Audio Streamer")
 
 MIME_TYPES = {
@@ -46,8 +58,8 @@ MIME_TYPES = {
 }
 
 # Path where cookies are stored. Override via COOKIES_FILE env var.
-# In Docker: mount ./cookies.txt:/app/cookies.txt:ro  OR  use POST /cookies
-COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+# Defaults to the named Docker volume so cookies survive container rebuilds.
+COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies_store/cookies.txt")
 
 # A well-known short public video used for health checks
 _HEALTH_CHECK_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo" — first YouTube video, stable forever
@@ -141,8 +153,10 @@ def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     """
     hashed = USERS.get(form_data.username)
     if not hashed or not verify_password(form_data.password, hashed):
+        log.warning("Failed login attempt for user '%s'", form_data.username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     token = create_access_token(subject=form_data.username)
+    log.info("Token issued for user '%s'", form_data.username)
     return {"access_token": token, "token_type": "bearer"}
 
 
@@ -159,23 +173,49 @@ def health_check():
     """
     cookies_loaded = Path(COOKIES_FILE).is_file()
 
+    # List every file in the cookies store directory
+    cookies_dir = Path(COOKIES_FILE).parent
+    cookies_files = []
+    if cookies_dir.is_dir():
+        for f in sorted(cookies_dir.iterdir()):
+            if f.is_file():
+                stat = f.stat()
+                age_days = round((time.time() - stat.st_mtime) / 86400, 1)
+                cookies_files.append({
+                    "name": f.name,
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    "age_days": age_days,
+                    "active": str(f) == COOKIES_FILE,
+                })
+
+    log.info("Health check — cookies_loaded=%s, files=%s", cookies_loaded, [f["name"] for f in cookies_files])
+
     try:
         opts = {**_ydl_opts_base(), "extract_flat": True, "skip_download": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(_HEALTH_CHECK_VIDEO, download=False)
         youtube_status = "ok"
         youtube_detail = None
+        log.info("Health check — youtube_status=ok")
     except Exception as exc:
         if _is_bot_detection_error(exc):
             youtube_status = "degraded"
             youtube_detail = "YouTube authentication required — cookies missing or expired"
+            log.warning("Health check — youtube_status=degraded: %s", exc)
         else:
             youtube_status = "error"
             youtube_detail = str(exc)
+            log.error("Health check — youtube_status=error: %s", exc)
 
     return {
         "status": "ok" if youtube_status == "ok" else "degraded",
         "cookies_loaded": cookies_loaded,
+        "cookies_store": {
+            "path": str(cookies_dir),
+            "active_file": COOKIES_FILE,
+            "files": cookies_files,
+        },
         "youtube_status": youtube_status,
         "youtube_detail": youtube_detail,
     }
@@ -190,12 +230,14 @@ async def upload_cookies(auth: Auth, file: UploadFile = File(...)):
     """
     content = await file.read()
     if not content.strip().startswith(b"# "):
+        log.warning("Cookie upload rejected — file does not look like Netscape cookies.txt")
         raise HTTPException(
             status_code=400,
             detail="File does not look like a Netscape cookies.txt (expected '# Netscape HTTP Cookie File' header)",
         )
     Path(COOKIES_FILE).parent.mkdir(parents=True, exist_ok=True)
     Path(COOKIES_FILE).write_bytes(content)
+    log.info("Cookies uploaded — %d bytes saved to %s", len(content), COOKIES_FILE)
     return {
         "detail": "Cookies saved. All subsequent requests will use them.",
         "size_bytes": len(content),
@@ -244,6 +286,7 @@ def search_videos(
     limit: int = Query(5, ge=1, le=25, description="Number of results (1–25)"),
 ):
     """Search YouTube and return video suggestions."""
+    log.info("Search — query=%r limit=%d", q, limit)
     opts = {
         **_ydl_opts_base(),
         "extract_flat": True,
@@ -253,9 +296,11 @@ def search_videos(
         with yt_dlp.YoutubeDL(opts) as ydl:
             results = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
     except Exception as e:
+        log.error("Search failed — query=%r error=%s", q, e)
         _raise_for_yt_error(e, "Search failed")
 
     entries = results.get("entries") or []
+    log.info("Search — query=%r returned %d results", q, len(entries))
     return {
         "query": q,
         "results": [
@@ -280,10 +325,13 @@ def video_info(
     url: str = Query(..., description="YouTube video URL"),
 ):
     """Return metadata for a YouTube video without downloading."""
+    log.info("Info — url=%s", url)
     try:
         info = _fetch_info(url)
     except Exception as e:
+        log.error("Info failed — url=%s error=%s", url, e)
         _raise_for_yt_error(e)
+    log.info("Info — title=%r", info.get("title"))
 
     return {
         "title": info.get("title"),
@@ -320,16 +368,20 @@ def stream_audio(
             detail=f"Unsupported format '{fmt}'. Choose from: {', '.join(MIME_TYPES)}",
         )
 
+    log.info("Stream — url=%s fmt=%s", url, fmt)
     try:
         info = _fetch_info(url)
     except Exception as e:
+        log.error("Stream fetch-info failed — url=%s error=%s", url, e)
         _raise_for_yt_error(e, "Could not fetch video info")
 
     title = _safe_filename(info.get("title", "audio"))
     filename = f"{title}.{fmt}"
     mime = MIME_TYPES[fmt]
+    log.info("Stream — title=%r filename=%r", title, filename)
 
     def generate():
+        t0 = time.monotonic()
         with tempfile.TemporaryDirectory() as tmpdir:
             output_template = os.path.join(tmpdir, "audio.%(ext)s")
             ydl_opts = {
@@ -348,15 +400,18 @@ def stream_audio(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
             except Exception as e:
-                print(f"[stream error] {e}")
+                log.error("Stream download failed — url=%s error=%s", url, e)
                 return
 
             files = list(Path(tmpdir).iterdir())
             if not files:
-                print("[stream error] yt-dlp produced no output file")
+                log.error("Stream — yt-dlp produced no output file for url=%s", url)
                 return
 
+            size = files[0].stat().st_size
+            log.info("Stream — starting transfer title=%r size=%d bytes", title, size)
             yield from _stream_chunks(str(files[0]))
+            log.info("Stream — done title=%r elapsed=%.1fs", title, time.monotonic() - t0)
 
     return StreamingResponse(
         generate(),
@@ -374,9 +429,11 @@ def stream_audio_raw(
     Stream the best available audio in its native format (no ffmpeg needed).
     Typically returns .webm/opus or .m4a depending on the video.
     """
+    log.info("Stream/raw — url=%s", url)
     try:
         info = _fetch_info(url)
     except Exception as e:
+        log.error("Stream/raw fetch-info failed — url=%s error=%s", url, e)
         _raise_for_yt_error(e, "Could not fetch video info")
 
     title = _safe_filename(info.get("title", "audio"))
@@ -392,8 +449,10 @@ def stream_audio_raw(
     ext = best_audio.get("ext", "m4a") if best_audio else "m4a"
     mime = MIME_TYPES.get(ext, "application/octet-stream")
     filename = f"{title}.{ext}"
+    log.info("Stream/raw — title=%r ext=%s", title, ext)
 
     def generate():
+        t0 = time.monotonic()
         with tempfile.TemporaryDirectory() as tmpdir:
             output_template = os.path.join(tmpdir, "audio.%(ext)s")
             ydl_opts = {
@@ -405,15 +464,18 @@ def stream_audio_raw(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
             except Exception as e:
-                print(f"[stream/raw error] {e}")
+                log.error("Stream/raw download failed — url=%s error=%s", url, e)
                 return
 
             files = list(Path(tmpdir).iterdir())
             if not files:
-                print("[stream/raw error] yt-dlp produced no output file")
+                log.error("Stream/raw — yt-dlp produced no output file for url=%s", url)
                 return
 
+            size = files[0].stat().st_size
+            log.info("Stream/raw — starting transfer title=%r size=%d bytes", title, size)
             yield from _stream_chunks(str(files[0]))
+            log.info("Stream/raw — done title=%r elapsed=%.1fs", title, time.monotonic() - t0)
 
     return StreamingResponse(
         generate(),

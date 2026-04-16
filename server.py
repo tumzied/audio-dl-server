@@ -63,7 +63,7 @@ MIME_TYPES = {
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies_store/cookies.txt")
 
 # A well-known short public video used for health checks
-_HEALTH_CHECK_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo" — first YouTube video, stable forever
+_HEALTH_CHECK_VIDEO = "https://www.youtube.com/watch?v=TK4N5W22Gts"
 
 # Warn in /cookies/status if cookies file is older than this many days
 _COOKIE_WARN_AGE_DAYS = int(os.getenv("COOKIE_WARN_AGE_DAYS", "14"))

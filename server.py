@@ -21,6 +21,7 @@ Run:
 
 import logging
 import os
+import shutil
 import time
 import tempfile
 from datetime import datetime, timezone
@@ -61,6 +62,16 @@ MIME_TYPES = {
 # Path where cookies are stored. Override via COOKIES_FILE env var.
 # Defaults to the named Docker volume so cookies survive container rebuilds.
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies_store/cookies.txt")
+
+# Disk cache for converted audio files — keyed by YouTube video ID + format.
+# Survives server restarts when backed by a Docker named volume.
+CACHE_DIR = os.getenv("CACHE_DIR", "/app/cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(video_id: str, fmt: str) -> str:
+    safe_id = "".join(c for c in video_id if c.isalnum() or c in "-_")
+    return os.path.join(CACHE_DIR, f"{safe_id}.{fmt}")
 
 # A well-known short public video used for health checks
 _HEALTH_CHECK_VIDEO = "https://www.youtube.com/watch?v=TK4N5W22Gts"
@@ -371,6 +382,7 @@ def stream_audio(
 ):
     """
     Download and stream audio converted to the requested format.
+    Converted files are cached on disk by video ID so repeat requests are instant.
     Requires ffmpeg in PATH for format conversion.
     """
     if fmt not in MIME_TYPES:
@@ -386,48 +398,69 @@ def stream_audio(
         log.error("Stream fetch-info failed — url=%s error=%s", url, e)
         _raise_for_yt_error(e, "Could not fetch video info")
 
+    video_id = info.get("id") or _safe_filename(info.get("title", "unknown"))
     title = _safe_filename(info.get("title", "audio"))
     filename = f"{title}.{fmt}"
     mime = MIME_TYPES[fmt]
-    log.info("Stream — title=%r filename=%r", title, filename)
+    cached = _cache_path(video_id, fmt)
 
-    def generate():
-        t0 = time.monotonic()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "audio.%(ext)s")
-            ydl_opts = {
-                **_ydl_opts_base(),
-                "format": _AUDIO_FORMAT,
-                "outtmpl": output_template,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": fmt,
-                        "preferredquality": "192",
-                    }
-                ],
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-            except Exception as e:
-                log.error("Stream download failed — url=%s error=%s", url, e)
-                return
+    if os.path.exists(cached):
+        size = os.path.getsize(cached)
+        log.info("Stream — cache HIT id=%s fmt=%s size=%d", video_id, fmt, size)
+        return StreamingResponse(
+            _stream_chunks(cached),
+            media_type=mime,
+            headers={
+                "Content-Disposition": _content_disposition(filename),
+                "Content-Length": str(size),
+                "X-Cache": "HIT",
+            },
+        )
 
-            files = list(Path(tmpdir).iterdir())
-            if not files:
-                log.error("Stream — yt-dlp produced no output file for url=%s", url)
-                return
+    log.info("Stream — cache MISS id=%s fmt=%s title=%r", video_id, fmt, title)
+    t0 = time.monotonic()
+    cached_part = cached + ".part"
 
-            size = files[0].stat().st_size
-            log.info("Stream — starting transfer title=%r size=%d bytes", title, size)
-            yield from _stream_chunks(str(files[0]))
-            log.info("Stream — done title=%r elapsed=%.1fs", title, time.monotonic() - t0)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_template = os.path.join(tmpdir, "audio.%(ext)s")
+        ydl_opts = {
+            **_ydl_opts_base(),
+            "format": _AUDIO_FORMAT,
+            "outtmpl": output_template,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": fmt,
+                    "preferredquality": "192",
+                }
+            ],
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            log.error("Stream download failed — url=%s error=%s", url, e)
+            _raise_for_yt_error(e, "Audio download failed")
+
+        files = list(Path(tmpdir).iterdir())
+        if not files:
+            log.error("Stream — yt-dlp produced no output for url=%s", url)
+            raise HTTPException(status_code=500, detail="No audio output produced")
+
+        shutil.copy2(str(files[0]), cached_part)
+
+    os.replace(cached_part, cached)
+    size = os.path.getsize(cached)
+    log.info("Stream — cached id=%s fmt=%s size=%d elapsed=%.1fs", video_id, fmt, size, time.monotonic() - t0)
 
     return StreamingResponse(
-        generate(),
+        _stream_chunks(cached),
         media_type=mime,
-        headers={"Content-Disposition": _content_disposition(filename)},
+        headers={
+            "Content-Disposition": _content_disposition(filename),
+            "Content-Length": str(size),
+            "X-Cache": "MISS",
+        },
     )
 
 

@@ -18,6 +18,8 @@ services:
       # Alternative: bind-mount a file directly (takes precedence if COOKIES_FILE is overridden):
       # - ./cookies.txt:/app/cookies_store/cookies.txt:ro
       - cookies_data:/app/cookies_store
+      - cache_data:/app/cache
 
 volumes:
   cookies_data:
+  cache_data:
